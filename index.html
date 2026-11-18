@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Workout Log</title>
+<meta name="theme-color" content="#0E0F12">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Workout Log">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png" type="image/png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="has-nav">
+<div class="app" id="app"></div>
+
+<nav class="nav" id="nav" aria-label="Sections">
+  <button type="button" id="nav-plan" data-act="nav" data-v="plan" aria-current="page">Plan</button>
+  <button type="button" id="nav-history" data-act="nav" data-v="history">History</button>
+  <button type="button" id="nav-settings" data-act="nav" data-v="settings">Settings</button>
+</nav>
+
+<div class="rest" id="rest" hidden role="timer" aria-live="polite">
+  <div class="rest-label" id="rest-label">Rest</div>
+  <div class="rest-time" id="rest-time">0:00</div>
+  <div class="rest-ctl">
+    <button type="button" id="rest-minus" data-act="rest-minus" aria-label="Take 15 seconds off">−15</button>
+    <button type="button" id="rest-plus" data-act="rest-plus" aria-label="Add 15 seconds">+15</button>
+    <button type="button" id="rest-skip" data-act="rest-skip">Skip</button>
+  </div>
+  <div class="rest-bar"><i id="rest-fill"></i></div>
+</div>
+
+<div class="sheet-wrap" id="sheet" hidden>
+  <div class="sheet" id="sheet-body" role="dialog" aria-modal="true"></div>
+</div>
+
+<script src="defaults.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
