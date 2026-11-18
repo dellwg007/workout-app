@@ -1,13 +1,13 @@
 /* ---------- Data: every editable thing lives in JSON files (config, exercises, weeks, logs) ----------
    Files are kept on this phone (localStorage) and mirrored to a private GitHub repo when online.
    Paths: config/config.json, config/exercises.json, weeks/<id>.json, logs/<sessionId>.json */
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.1.0';
 const DEFAULTS = window.WL_DEFAULTS || {};
 const STORE_KEY = 'wl.store.v1';
 const PLAN = {weeks:[]};
 const ALL = [];
 let CFG = {}, EXL = {};
-const store = {files:{}, dirty:{}, settings:{gh:{owner:'', repo:'', branch:'main', token:''}, tredict:{token:'', base:''}}, lastPull:null, lastPush:null, rec:null, setupDone:false};
+const store = {files:{}, dirty:{}, settings:{gh:{owner:'', repo:'', branch:'main', token:''}, tredict:{token:'', base:'', mode:'github'}}, lastPull:null, lastPush:null, rec:null, setupDone:false};
 
 function deepMerge(a, b){
   if (Array.isArray(b) || typeof b !== 'object' || b === null) return b === undefined ? a : b;
@@ -17,7 +17,7 @@ function deepMerge(a, b){
 }
 function loadStore(){
   try { var raw = localStorage.getItem(STORE_KEY); if (raw){ var o = JSON.parse(raw); Object.keys(o).forEach(function(k){ store[k] = o[k]; }); } } catch (e) {}
-  store.settings = deepMerge({gh:{owner:'', repo:'', branch:'main', token:''}, tredict:{token:'', base:''}}, store.settings || {});
+  store.settings = deepMerge({gh:{owner:'', repo:'', branch:'main', token:''}, tredict:{token:'', base:'', mode:'github'}}, store.settings || {});
   Object.keys(DEFAULTS).forEach(function(p){ if (!store.files[p]) store.files[p] = {data:clone(DEFAULTS[p]), sha:null}; });
 }
 let persistT = null;
@@ -288,7 +288,11 @@ function ago(iso){
   if (s < 90) return 'just now'; if (s < 3600) return Math.round(s / 60) + ' min ago';
   if (s < 86400) return Math.round(s / 3600) + ' h ago'; return Math.round(s / 86400) + ' d ago';
 }
-function save(id){ var l = logs[id]; if (!l) return; writeFile('logs/' + id + '.json', l); setSync(); }
+function save(id){
+  var l = logs[id]; if (!l) return;
+  if (l.status === 'done' && planOf(id)){ try { l.summary = summaryText(id); } catch (e) {} }
+  writeFile('logs/' + id + '.json', l); setSync();
+}
 function ghReady(){ var g = store.settings.gh; return !!(g.owner && g.repo && g.token); }
 function encPath(p){ return p.split('/').map(encodeURIComponent).join('/'); }
 async function gh(method, path, body){
@@ -305,12 +309,14 @@ async function gh(method, path, body){
 function b64enc(str){ return btoa(unescape(encodeURIComponent(str))); }
 function b64dec(b){ return decodeURIComponent(escape(atob(String(b).replace(/\s/g, '')))); }
 const SYNCED = /^(config|weeks|logs)\/[^/]+\.json$/;
+/* Written only by the Tredict sync job in the data repo. Pulled, never pushed. */
+const PULLED = /^tredict\/[^/]+\.json$/;
 async function pull(){
   var g = store.settings.gh, remote = {};
   repoEmpty = false;
   try {
     var tree = await gh('GET', '/git/trees/' + encodeURIComponent(g.branch || 'main') + '?recursive=1');
-    (tree.tree || []).forEach(function(t){ if (t.type === 'blob' && SYNCED.test(t.path)) remote[t.path] = t.sha; });
+    (tree.tree || []).forEach(function(t){ if (t.type === 'blob' && (SYNCED.test(t.path) || PULLED.test(t.path))) remote[t.path] = t.sha; });
   } catch (e) {
     if (e.status === 409 || (e.status === 404 && e.detail && /empty/i.test(e.detail.message || ''))) repoEmpty = true;
     else if (e.status === 404){
@@ -321,6 +327,7 @@ async function pull(){
   for (var p in remote){
     var f = store.files[p];
     if (f && f.sha === remote[p]) continue;
+    if (store.dirty[p] && f && f.sha == null && !/^logs\//.test(p)) delete store.dirty[p]; // built-in default edited before the first pull: the repo's copy wins
     if (store.dirty[p]){ if (f) f.remoteSha = remote[p]; continue; }
     var blob = await gh('GET', '/git/blobs/' + remote[p]);
     try { store.files[p] = {data:JSON.parse(b64dec(blob.content)), sha:remote[p]}; }
@@ -333,7 +340,7 @@ async function push(){
   var g = store.settings.gh, paths = Object.keys(store.dirty);
   for (var i = 0; i < paths.length; i++){
     var p = paths[i], f = store.files[p], stamp = store.dirty[p];
-    if (!f || !SYNCED.test(p)){ delete store.dirty[p]; continue; }
+    if (!f || !SYNCED.test(p) || PULLED.test(p)){ delete store.dirty[p]; continue; }
     var body = {message:'Update ' + p + ' from workout app', content:b64enc(JSON.stringify(f.data, null, 2) + '\n')};
     if (!repoEmpty) body.branch = g.branch || 'main';
     var sha = f.remoteSha || f.sha; if (sha) body.sha = sha;
@@ -361,6 +368,7 @@ async function sync(manual){
     await pull(); await push();
     syncState = {state:'ok', msg:''};
     loadAll();
+    if (tdGh()){ applyTredictState(); loadRecovery(false); }
     if (S.view !== 'session') render();
     retryPendingTredict();
   } catch (e) {
@@ -966,6 +974,28 @@ function nextLabel(p, exId, i){
 /* ---------- Tredict (Personal API token, stored only on this phone) ---------- */
 const TS = {};
 function tdOn(){ return CFG.tredict && CFG.tredict.enabled !== false; }
+/* "Through GitHub" (default): the app never calls Tredict. A job in the data repo does, and leaves its results in tredict/*.json. */
+function tdGh(){ return (store.settings.tredict.mode || 'github') !== 'direct'; }
+function tdState(){ return fileData('tredict/state.json') || {}; }
+function tdGhLine(){
+  var st = tdState(), rec = fileData('tredict/recovery.json'), act = fileData('tredict/activities.json');
+  if (!ghReady()) return 'Connect GitHub above first. The Tredict sync runs there.';
+  if (st.status && !st.status.ok) return 'The GitHub job says: ' + st.status.msg;
+  var at = [rec && rec.updatedAt, act && act.updatedAt].filter(Boolean).sort().pop();
+  if (!st.status && !at) return 'No word from the GitHub job yet. Add the TREDICT_TOKEN secret, then run Tredict sync once from the repo’s Actions tab.';
+  return 'Working. Tredict data last changed ' + (at ? ago(at) : 'a while ago') + '.';
+}
+function applyTredictState(){
+  if (!tdOn() || !tdGh()) return;
+  var sent = tdState().sent || {};
+  Object.keys(sent).forEach(function(id){
+    var e = sent[id], l = logs[id], p = planOf(id);
+    if (!l || !p || !e || !e.activityId || (l.tredict && l.tredict.id === e.activityId)) return;
+    l.tredict = {id:e.activityId, at:e.at || null, via:'github'}; delete l.tredictPending;
+    if (e.watch && CFG.tredict.importWatchStats !== false) mergeWatch(l, p, e.watch, e.warmup);
+    save(id);
+  });
+}
 function tdBase(){ return (store.settings.tredict.base || (CFG.tredict && CFG.tredict.apiBase) || 'https://www.tredict.com/api/oauth/v2/').replace(/\/?$/, '/'); }
 async function td(method, path, body){
   var tok = store.settings.tredict.token;
@@ -1007,8 +1037,18 @@ async function tdActivitiesOn(dateStr){
 function distMi(o){ var m = pick(o, ['summary.distance', 'distance']); return m ? Math.round(m / 1609.34 * 100) / 100 : null; }
 function importWatch(l, p, act, rows){
   var dur = pick(act, ['summary.duration', 'duration']);
-  l.watch = {min:dur ? Math.round(dur / 60) : null, hr:pick(act, ['summary.heartrate.avg', 'summary.heartrate', 'summary.heartrateAvg']),
+  var w = {min:dur ? Math.round(dur / 60) : null, hr:pick(act, ['summary.heartrate.avg', 'summary.heartrate', 'summary.heartrateAvg']),
     hrMax:pick(act, ['summary.heartrateMax', 'summary.heartrate.max']), kcal:pick(act, ['summary.calories', 'calories']), mi:distMi(act), sport:act.subSportType || act.sportType || ''};
+  var wu = null;
+  if (p.kind !== 'cardio' && p.warmup && p.warmup.dist){
+    var st = Date.parse(act.date);
+    var r0 = rows.filter(function(r){ var t = Date.parse(r.date); return r.id !== act.id && r.sportType === 'running' && t < st && st - t < 2 * 3600e3; })[0];
+    if (r0){ var wsec = pick(r0, ['summary.duration', 'duration']); wu = {mi:distMi(r0), min:wsec ? Math.round(wsec / 60) : null}; }
+  }
+  mergeWatch(l, p, w, wu);
+}
+function mergeWatch(l, p, w, wu){
+  l.watch = {min:nnum(w.min, null), hr:nnum(w.hr, null), hrMax:nnum(w.hrMax, null), kcal:nnum(w.kcal, null), mi:nnum(w.mi, null), sport:String(w.sport || '')};
   if (p.kind === 'cardio'){
     if (!l.cardio) l.cardio = {minutes:'', dist:'', hr:''};
     if (!l.cardio.minutes && l.watch.min) l.cardio.minutes = String(l.watch.min);
@@ -1016,14 +1056,11 @@ function importWatch(l, p, act, rows){
     if (!l.cardio.dist && l.watch.mi) l.cardio.dist = String(l.watch.mi);
     return;
   }
-  if (!p.warmup || !p.warmup.dist) return;
-  var st = Date.parse(act.date);
-  var wu = rows.filter(function(r){ var t = Date.parse(r.date); return r.id !== act.id && r.sportType === 'running' && t < st && st - t < 2 * 3600e3; })[0];
-  if (!wu) return;
-  var mi = distMi(wu), wsec = pick(wu, ['summary.duration', 'duration']);
+  if (!p.warmup || !p.warmup.dist || !wu) return;
+  var mi = nnum(wu.mi, null), wmin = nnum(wu.min, null);
   if (!l.warmup) l.warmup = {done:false, dist:'', time:''};
   if (mi && (!l.warmup.dist || l.warmup.dist === p.warmup.distPh)) l.warmup.dist = String(mi);
-  if (wsec && !l.warmup.time) l.warmup.time = String(Math.round(wsec / 60));
+  if (wmin && !l.warmup.time) l.warmup.time = String(wmin);
   l.warmup.done = true;
 }
 function watchLine(l){
@@ -1034,6 +1071,16 @@ function watchLine(l){
 function tsHtml(id){
   if (!tdOn()) return '';
   var st = TS[id], l = logs[id];
+  if (tdGh()){
+    if (l && l.tredict) return '<div class="ts done" id="ts-' + id + '"><span>✓ Synced with your Tredict workout</span></div>';
+    var s0 = tdState(), wt = (s0.waiting || {})[id];
+    var msg = !ghReady() ? 'Connect GitHub in Settings to send this to Tredict.'
+      : store.dirty['logs/' + id + '.json'] ? 'Sends to Tredict once this log syncs to GitHub.'
+      : s0.status && !s0.status.ok ? 'Not in Tredict yet. ' + s0.status.msg
+      : wt ? wt.msg + ' It checks again every hour.'
+      : 'Sending to Tredict through GitHub. This takes a minute or two.';
+    return '<div class="ts nomatch" id="ts-' + id + '"><span>' + esc(msg) + '</span>' + (ghReady() ? '<button type="button" class="link" data-act="tcheck" data-sid="' + id + '">Check now</button>' : '') + '</div>';
+  }
   if (!st && l && l.tredict) st = {state:'done', msg:'Synced with your Tredict workout'};
   if (!st && l && l.tredictPending) st = {state:'nomatch', msg:'Waiting to send to Tredict'};
   if (!st) return '<div class="ts" id="ts-' + id + '"><span>Not in Tredict yet</span><button type="button" class="link" data-act="tsync" data-sid="' + id + '">Send to Tredict</button></div>';
@@ -1043,6 +1090,7 @@ function tsHtml(id){
 function setTs(id, state, msg){ TS[id] = {state:state, msg:msg}; var el = $('ts-' + id); if (el) el.outerHTML = tsHtml(id); }
 async function syncTredict(id, auto){
   var l = logs[id], p = planOf(id); if (!l || !p || !tdOn()) return;
+  if (tdGh()){ var el0 = $('ts-' + id); if (el0) el0.outerHTML = tsHtml(id); return; }
   if (TS[id] && TS[id].state === 'working') return;
   if (!store.settings.tredict.token){ setTs(id, 'error', tdErr({code:'no_token'})); return; }
   if (!navigator.onLine){ l.tredictPending = true; save(id); setTs(id, 'nomatch', tdErr({code:'offline'})); return; }
@@ -1081,7 +1129,7 @@ async function syncTredict(id, auto){
   }
 }
 function retryPendingTredict(){
-  if (!tdOn() || !store.settings.tredict.token || !navigator.onLine) return;
+  if (!tdOn() || tdGh() || !store.settings.tredict.token || !navigator.onLine) return;
   Object.keys(logs).forEach(function(id){ var l = logs[id]; if (l && l.status === 'done' && l.tredictPending && !(TS[id] && TS[id].state === 'working')) syncTredict(id, false); });
 }
 
@@ -1108,6 +1156,12 @@ function parseBodyObj(res){
 function applyRec(c){ REC.sleep = c.sleep; REC.hrv = c.hrv; REC.body = c.body; REC.at = c.at; }
 async function loadRecovery(force){
   if (!tdOn()){ REC.err = 'off'; drawRec(); return; }
+  if (tdGh()){
+    var r = fileData('tredict/recovery.json'), st = tdState();
+    if (r && (r.sleep || r.hrv || r.body)){ applyRec({at:Date.parse(r.updatedAt) || null, sleep:r.sleep || [], hrv:r.hrv || [], body:r.body || {wt:[], rhr:[]}}); REC.err = null; }
+    else { applyRec({at:null, sleep:null, hrv:null, body:null}); REC.err = !ghReady() ? 'gh_off' : (st.status && !st.status.ok) ? {gh:st.status.msg} : 'gh_wait'; }
+    drawRec(); return;
+  }
   var c = store.rec;
   if (c) applyRec(c);
   if (!store.settings.tredict.token){ REC.err = 'no_token'; drawRec(); return; }
@@ -1130,8 +1184,10 @@ function recInner(){
   var head = '<div class="rec-h"><span class="eyebrow">Recovery</span><span class="rec-src">' + (REC.loading ? 'Updating…' : REC.at ? 'from Tredict · ' + ago(new Date(REC.at).toISOString()) : 'from your watch via Tredict') + '</span></div>';
   var hasData = (REC.sleep && REC.sleep.length) || (REC.hrv && REC.hrv.length) || (REC.body && (REC.body.wt.length || REC.body.rhr.length));
   if (!hasData){
-    var msg = REC.err === 'no_token' ? 'Add your Tredict token to see sleep, HRV and weight here.' : REC.err === 'offline' ? 'Offline. Recovery shows up next time you have signal.' : REC.err ? tdErr(REC.err) : 'Loading…';
-    var btn = REC.err === 'no_token' ? '<button type="button" class="link" data-act="nav" data-v="settings">Settings</button>' : (REC.err && REC.err !== 'offline') ? '<button type="button" class="link" data-act="rec-retry">Retry</button>' : '';
+    var msg = REC.err === 'no_token' ? 'Add your Tredict token to see sleep, HRV and weight here.' : REC.err === 'offline' ? 'Offline. Recovery shows up next time you have signal.'
+      : REC.err === 'gh_off' ? 'Connect GitHub in Settings to see sleep, HRV and weight here.' : REC.err === 'gh_wait' ? 'Sleep, HRV and weight show up after the Tredict sync job first runs on GitHub.'
+      : REC.err && REC.err.gh ? REC.err.gh : REC.err ? tdErr(REC.err) : 'Loading…';
+    var btn = (REC.err === 'no_token' || REC.err === 'gh_off') ? '<button type="button" class="link" data-act="nav" data-v="settings">Settings</button>' : (REC.err && REC.err !== 'offline') ? '<button type="button" class="link" data-act="rec-retry">Retry</button>' : '';
     return head + '<div class="rec-msg"><span>' + esc(msg) + '</span>' + btn + '</div>';
   }
   var tiles = [], lows = 0;
@@ -1194,13 +1250,17 @@ function viewSettings(){
   var t = store.settings.tredict, td0 = CFG.tredict || {}, pr = CFG.progression || {}, rc = CFG.recovery || {}, at = CFG.athlete || {}, tm = CFG.timer || {};
   var h = '<header class="top"><div><div class="eyebrow">App setup</div><h1>Settings</h1></div><div class="sync" id="sync"></div></header>';
   h += ghSection();
+  var gm = (t.mode || 'github') !== 'direct';
   h += '<section class="set"><h2>Tredict</h2><p class="hint">Brings in heart rate, sleep, HRV and weight from your watch, and writes your sets into each Tredict workout. Tokens pause if you don’t open Tredict for 10 days.</p>' +
     tgl('td-enabled', 'Use Tredict', td0.enabled !== false) +
+    '<label class="fld" for="td-mode"><span>How the app reaches Tredict</span><select class="textin" id="td-mode"><option value="github"' + (gm ? ' selected' : '') + '>Through GitHub (recommended)</option><option value="direct"' + (gm ? '' : ' selected') + '>Directly from this phone</option></select></label>' +
+    '<div id="td-gh"' + (gm ? '' : ' hidden') + '><p class="hint">Your Tredict token goes in your workout-data repo on GitHub, not on this phone: Settings → Secrets and variables → Actions → New repository secret, named TREDICT_TOKEN. A job there syncs about every hour and a minute or two after each logged workout. This phone only reads what it brings back.</p></div>' +
+    '<div id="td-direct"' + (gm ? ' hidden' : '') + '>' +
     fld('td-token', 'Personal API token', t.token, 'password', 'autocomplete="off"') +
-    fld('td-base', 'API address (change only if you set up the proxy)', t.base || '', 'url', 'autocapitalize="off" spellcheck="false" placeholder="' + esc(td0.apiBase || '') + '"') +
+    fld('td-base', 'API address (change only if you set up the proxy)', t.base || '', 'url', 'autocapitalize="off" spellcheck="false" placeholder="' + esc(td0.apiBase || '') + '"') + '</div>' +
     tgl('td-notes', 'Write my sets into Tredict notes', td0.writeSetsToNotes !== false) +
     tgl('td-import', 'Import watch stats into my log', td0.importWatchStats !== false) +
-    '<div class="row"><button type="button" class="btn ghost" id="td-test" data-act="td-test">Test</button><button type="button" class="btn" id="td-save" data-act="td-save">Save</button></div><p class="hint" id="td-status"></p></section>';
+    '<div class="row"><button type="button" class="btn ghost" id="td-test" data-act="td-test">Test</button><button type="button" class="btn" id="td-save" data-act="td-save">Save</button></div><p class="hint" id="td-status">' + (gm ? esc(tdGhLine()) : '') + '</p></section>';
   h += '<section class="set"><h2>Goal and progression</h2><div class="fgrid">' +
     fld('cf-goal', 'Goal weight (lb)', at.goalWeightLb, 'number', 'inputmode="decimal"') +
     fld('cf-up', 'Upper body step (lb)', pr.upperIncrementLb, 'number', 'inputmode="decimal"') +
@@ -1353,7 +1413,8 @@ document.addEventListener('click', function(ev){
       var si = $('swap-in'); if (si){ si.focus(); si.select(); }
       break;
     }
-    case 'rec-retry': loadRecovery(true); break;
+    case 'rec-retry': if (tdGh()) sync(false); else loadRecovery(true); break;
+    case 'tcheck': { var sid0 = b.dataset.sid; sync(false).then(function(){ var el = $('ts-' + sid0); if (el) el.outerHTML = tsHtml(sid0); }); break; }
     case 'gh-save': {
       var ghv = {owner:$('gh-owner').value.trim(), repo:$('gh-repo').value.trim(), branch:$('gh-branch').value.trim() || 'main', token:$('gh-token').value.trim()};
       store.settings.gh = ghv; persistNow();
@@ -1370,10 +1431,16 @@ document.addEventListener('click', function(ev){
     }
     case 'skip-setup': store.setupDone = true; persistNow(); S.view = 'settings'; render(); break;
     case 'td-save': case 'td-test': {
-      store.settings.tredict = {token:$('td-token').value.trim(), base:$('td-base').value.trim()};
+      store.settings.tredict = {token:$('td-token').value.trim(), base:$('td-base').value.trim(), mode:$('td-mode').value === 'direct' ? 'direct' : 'github'};
       var c1 = cfgFile(); c1.tredict = Object.assign({}, c1.tredict || {}, {enabled:$('td-enabled').checked, writeSetsToNotes:$('td-notes').checked, importWatchStats:$('td-import').checked});
       writeFile('config/config.json', c1); loadAll(); persistNow();
       if (act === 'td-save'){ setHint('td-status', 'Saved.'); store.rec = null; loadRecovery(true); break; }
+      if (tdGh()){
+        if (!ghReady()){ setHint('td-status', tdGhLine()); break; }
+        setHint('td-status', 'Checking GitHub…'); syncing = false;
+        sync(false).then(function(){ setHint('td-status', syncState.state === 'error' ? syncState.msg : tdGhLine()); });
+        break;
+      }
       setHint('td-status', 'Testing…');
       td('GET', 'activityList?pageSize=50').then(function(r){ setHint('td-status', 'Connected. Tredict returned ' + actList(r).length + ' recent workouts.'); store.rec = null; loadRecovery(true); }, function(e){ setHint('td-status', tdErr(e)); });
       break;
@@ -1445,7 +1512,10 @@ setInterval(function(){
 }, 1000);
 document.addEventListener('visibilitychange', function(){ if (!document.hidden && R.end) drawRest(); });
 
-document.addEventListener('change', function(ev){ if (ev.target && ev.target.id === 'import-file' && ev.target.files && ev.target.files[0]) importBackup(ev.target.files[0]); });
+document.addEventListener('change', function(ev){
+  if (ev.target && ev.target.id === 'import-file' && ev.target.files && ev.target.files[0]) importBackup(ev.target.files[0]);
+  if (ev.target && ev.target.id === 'td-mode'){ var g = ev.target.value !== 'direct'; $('td-gh').hidden = !g; $('td-direct').hidden = g; setHint('td-status', ''); }
+});
 
 document.addEventListener('input', function(ev){
   var t = ev.target, k = t && t.id && {'gh-owner':'owner', 'gh-repo':'repo', 'gh-branch':'branch', 'gh-token':'token'}[t.id];
