@@ -1,6 +1,6 @@
 /* Offline support: the app shell is cached on first visit and served from the phone afterwards.
    Calls to GitHub and Tredict always go to the network. Bump VERSION on every release. */
-const VERSION = 'wl-1.0.0';
+const VERSION = 'wl-1.0.1';
 const SHELL = ['./', './index.html', './style.css', './app.js', './defaults.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 self.addEventListener('install', function(e){

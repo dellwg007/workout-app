@@ -1,7 +1,7 @@
 /* ---------- Data: every editable thing lives in JSON files (config, exercises, weeks, logs) ----------
    Files are kept on this phone (localStorage) and mirrored to a private GitHub repo when online.
    Paths: config/config.json, config/exercises.json, weeks/<id>.json, logs/<sessionId>.json */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const DEFAULTS = window.WL_DEFAULTS || {};
 const STORE_KEY = 'wl.store.v1';
 const PLAN = {weeks:[]};
@@ -1355,9 +1355,17 @@ document.addEventListener('click', function(ev){
     }
     case 'rec-retry': loadRecovery(true); break;
     case 'gh-save': {
-      store.settings.gh = {owner:$('gh-owner').value.trim(), repo:$('gh-repo').value.trim(), branch:$('gh-branch').value.trim() || 'main', token:$('gh-token').value.trim()};
-      store.setupDone = true; persistNow(); setHint('set-sync-status', 'Syncing…');
-      sync(true).then(function(){ if (S.view === 'setup' && PLAN.weeks.length){ S.view = 'plan'; render(); } else setHint('set-sync-status', syncLine()); });
+      var ghv = {owner:$('gh-owner').value.trim(), repo:$('gh-repo').value.trim(), branch:$('gh-branch').value.trim() || 'main', token:$('gh-token').value.trim()};
+      store.settings.gh = ghv; persistNow();
+      var miss = [!ghv.owner && 'GitHub username', !ghv.repo && 'Data repo name', !ghv.token && 'Access token'].filter(Boolean);
+      if (miss.length){ setHint('set-sync-status', 'Fill in: ' + miss.join(', ') + '.'); break; }
+      if (!navigator.onLine){ setHint('set-sync-status', 'No signal. Saved, and it will sync when you\u2019re back online.'); break; }
+      store.setupDone = true; persistNow(); setHint('set-sync-status', 'Checking GitHub…');
+      syncing = false;
+      sync(true).then(function(){
+        if (syncState.state !== 'error' && S.view === 'setup' && PLAN.weeks.length){ S.view = 'plan'; render(); }
+        else setHint('set-sync-status', syncState.state === 'error' ? syncState.msg : syncLine());
+      }, function(e){ setHint('set-sync-status', 'Sync error: ' + (e && e.message || e)); });
       break;
     }
     case 'skip-setup': store.setupDone = true; persistNow(); S.view = 'settings'; render(); break;
@@ -1439,6 +1447,12 @@ document.addEventListener('visibilitychange', function(){ if (!document.hidden &
 
 document.addEventListener('change', function(ev){ if (ev.target && ev.target.id === 'import-file' && ev.target.files && ev.target.files[0]) importBackup(ev.target.files[0]); });
 
+document.addEventListener('input', function(ev){
+  var t = ev.target, k = t && t.id && {'gh-owner':'owner', 'gh-repo':'repo', 'gh-branch':'branch', 'gh-token':'token'}[t.id];
+  if (k){ store.settings.gh[k] = t.value.trim(); persistNow(); }
+});
+window.addEventListener('error', function(e){ setHint('set-sync-status', 'App error: ' + (e && e.message || 'unknown')); });
+window.addEventListener('unhandledrejection', function(e){ setHint('set-sync-status', 'App error: ' + (e && e.reason && e.reason.message || e && e.reason || 'unknown')); });
 loadStore();
 loadAll();
 if (!PLAN.weeks.length && !ghReady() && !store.setupDone) S.view = 'setup';
